@@ -1,5 +1,5 @@
 [Unit]
-Description=Rust RDP Knock Gateway
+Description=rdpx RDP gateway
 After=network-online.target
 Wants=network-online.target
 

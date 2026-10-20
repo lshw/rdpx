@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
-use ironrdp_acceptor::{Acceptor, BeginResult};
+use ironrdp_acceptor::{Acceptor, BeginResult, DesktopSize};
 use ironrdp_pdu::nego::SecurityProtocol;
-use ironrdp_server::{Credentials, DesktopSize, TlsIdentityCtx};
+use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_tokio::TokioFramed;
 use serde::Deserialize;
 use std::{collections::HashMap, net::{IpAddr, SocketAddr},
@@ -10,6 +10,7 @@ use tokio::{io::copy_bidirectional, net::{TcpListener, TcpStream}, process::Comm
     sync::{Mutex, Semaphore}, time::timeout};
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 use tracing::{info, warn};
+use x509_cert::der::Decode;
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -94,11 +95,18 @@ async fn main() -> Result<()> {
     // A single final line ending is allowed; other whitespace is part of the password.
     let password = password.strip_suffix("\r\n").or_else(|| password.strip_suffix('\n')).unwrap_or(&password).to_owned();
     if password.is_empty() || password.contains(['\r', '\n']) { bail!("NLA password file must contain one nonempty line"); }
-    let identity = TlsIdentityCtx::init_from_paths(Path::new(&config.tls_cert), Path::new(&config.tls_key))?;
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(Path::new(&config.tls_cert))?))
+        .collect::<std::result::Result<Vec<_>, _>>().context("reading TLS certificates")?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(Path::new(&config.tls_key))?))?
+        .context("missing TLS private key")?;
+    let cert = certs.first().context("missing TLS certificate")?;
+    let cert = x509_cert::Certificate::from_der(cert).context("invalid TLS certificate")?;
+    let public_key = cert.tbs_certificate.subject_public_key_info.subject_public_key.as_bytes()
+        .context("TLS public key is not byte-aligned")?.to_vec();
     let tls_config = ServerConfig::builder().with_no_client_auth()
-        .with_single_cert(identity.certs.clone(), identity.priv_key.clone_key())?;
+        .with_single_cert(certs, key)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let public_key = Arc::new(identity.pub_key);
+    let public_key = Arc::new(public_key);
     let listener = TcpListener::bind(config.listen).await?;
     let sem = Arc::new(Semaphore::new(config.max_clients));
     let state = Arc::new(State { grants: Mutex::new(HashMap::new()), config, password });

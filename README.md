@@ -1,4 +1,4 @@
-# Rust RDP Knock Gateway (prototype)
+# rdpx (prototype)
 
 The first RDP connection authenticates the gateway account using NLA (CredSSP/NTLM). After successful authentication and the optional hook, the gateway grants the TCP peer IP for a configured period and closes the connection. A subsequent connection from that IP is proxied byte-for-byte to the Windows backend, whose credentials and NLA settings are independent.
 
@@ -14,3 +14,7 @@ This is a prototype: end-to-end interoperability with Windows `mstsc` has not ye
 6. Connect using the gateway account. After `frontend NLA authentication succeeded`, reconnect and use the Windows account. Check `journalctl -u rdpx -f` for errors. For backend timeouts check routing and TCP 3389 firewall rules from the gateway to Windows.
 
 Grants are in memory and disappear on restart. Only TCP is forwarded; UDP acceleration is not supported. Use a trusted certificate matching the connection name rather than ignoring certificate warnings.
+
+## Size-optimized build
+
+Run `cargo build --locked --profile small` to produce `target/small/rdpx`. This profile favors size, takes longer to build, strips symbols, and aborts the process on panic. For OpenWrt, cross-compile with a toolchain matching the device architecture and C library, and configure a procd service.
