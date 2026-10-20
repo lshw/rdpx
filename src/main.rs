@@ -114,7 +114,7 @@ async fn auth(stream: TcpStream, peer: SocketAddr, state: Arc<State>, acceptor: 
         .with_tls(acceptor)
         .with_input_handler(NoopInput)
         .with_display_handler(NoopDisplay)
-        .with_credential_validator(validator)
+        .with_credential_validator(Some(validator))
         .build();
     let deadline = Duration::from_secs(state.config.handshake_timeout_seconds);
     tokio::select! {
