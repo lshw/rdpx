@@ -1,0 +1,15 @@
+rdpx Debian 软件包
+================================
+
+安装后，参照 /usr/share/doc/rdpx/examples/config.toml.example
+创建 /etc/rdpx/config.toml，并配置证书、私钥和密码文件。
+这些文件必须可供 rdpknock 系统账号读取；密码文件应只允许该账号读取。
+
+服务不会自动启用或启动。完成配置后，运行：
+
+    systemctl enable --now rdpx
+
+使用 dpkg-buildpackage -us -uc -b 构建二进制包。Cargo 需要能够获取
+Cargo.lock 中的依赖，或提前准备好本地缓存。Debian 11 自带的 Rust
+工具链过旧；请使用 rustup 安装 Rust 1.92.0，并确保构建时 PATH 优先
+包含 $HOME/.cargo/bin。详细步骤见 README.cn.md 的 Debian 11 构建章节。

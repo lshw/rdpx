@@ -1,0 +1,15 @@
+Source: rdpx
+Section: net
+Priority: optional
+Maintainer: liu shiwei <liushiwei@gmail.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: rdpx
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: RDP gateway with NLA authentication and IP-based access
+ Authenticates the first RDP connection using NLA and temporarily grants
+ the client IP access to a TCP proxy for a Windows RDP backend.
+https://github.com/lshw/rdpx

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ] && ! getent passwd rdpknock >/dev/null; then
+    adduser --system --group --no-create-home --home /nonexistent rdpknock
+fi
+
+#DEBHELPER#

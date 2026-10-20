@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME ?= $(HOME)/.cargo
+export CARGO_TARGET_DIR ?= target
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --locked
+endif
+
+override_dh_auto_install:
+	install -Dm755 $(CARGO_TARGET_DIR)/release/rdpx debian/rdpx/usr/bin/rdpx
+	install -Dm644 config/config.toml.example debian/rdpx/usr/share/doc/rdpx/examples/config.toml.example
+	install -Dm644 systemd/rdpx.service debian/rdpx/usr/lib/systemd/system/rdpx.service
+	sed -i 's|/usr/local/bin/rdpx|/usr/bin/rdpx|' debian/rdpx/usr/lib/systemd/system/rdpx.service
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
