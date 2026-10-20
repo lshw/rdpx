@@ -1,0 +1,12 @@
+listen = "0.0.0.0:3389"
+backend = "192.168.20.100:3389"
+tls_cert = "/etc/rdpx/cert.pem"
+tls_key = "/etc/rdpx/key.pem"
+username = "gateway"
+password_hash_file = "/etc/rdpx/password.argon2"
+authorization_seconds = 300
+max_clients = 128
+handshake_timeout_seconds = 20
+backend_connect_timeout_seconds = 5
+# Optional trusted executable, called with client IP as its sole argument.
+# on_authorized_script = "/usr/local/libexec/rdp-knock-hook"
