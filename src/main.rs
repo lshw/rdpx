@@ -152,22 +152,24 @@ async fn main() -> Result<()> {
     let sem = Arc::new(Semaphore::new(config.max_clients));
     let state = Arc::new(State { grants: Mutex::new(HashMap::new()), config, password_hash });
     info!(listen = %state.config.listen, backend = %state.config.backend, "RDP gateway started");
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let Ok(permit) = sem.clone().try_acquire_owned() else { warn!(%peer, "connection limit exceeded"); continue; };
-        let state = state.clone();
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let result = if state.allowed(peer.ip()).await {
-                proxy(stream, peer, state.config.backend,
-                    Duration::from_secs(state.config.backend_connect_timeout_seconds)).await
-            } else {
-                auth(stream, peer, state, acceptor).await
-            };
-            if let Err(e) = result { warn!(%peer, error = %e, "connection ended"); }
-        });
-    }
+    tokio::task::LocalSet::new().run_until(async move {
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            let Ok(permit) = sem.clone().try_acquire_owned() else { warn!(%peer, "connection limit exceeded"); continue; };
+            let state = state.clone();
+            let acceptor = acceptor.clone();
+            tokio::task::spawn_local(async move {
+                let _permit = permit;
+                let result = if state.allowed(peer.ip()).await {
+                    proxy(stream, peer, state.config.backend,
+                        Duration::from_secs(state.config.backend_connect_timeout_seconds)).await
+                } else {
+                    auth(stream, peer, state, acceptor).await
+                };
+                if let Err(e) = result { warn!(%peer, error = %e, "connection ended"); }
+            });
+        }
+    }).await
 }
 
 #[cfg(test)]
