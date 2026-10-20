@@ -2,4 +2,5 @@
 *.pem
 *.key
 *.argon2
+password
 config.toml

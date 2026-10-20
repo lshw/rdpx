@@ -1,18 +1,15 @@
-use anyhow::{anyhow, bail, Context, Result};
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use async_trait::async_trait;
-use ironrdp_server::{
-    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
-    DesktopSize, KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay,
-    RdpServerDisplayUpdates, RdpServerInputHandler,
-};
+use anyhow::{bail, Context, Result};
+use ironrdp_acceptor::{Acceptor, BeginResult};
+use ironrdp_pdu::nego::SecurityProtocol;
+use ironrdp_server::{Credentials, DesktopSize, TlsIdentityCtx};
+use ironrdp_tokio::TokioFramed;
 use serde::Deserialize;
-use std::{collections::HashMap, fs::File, io::BufReader, net::{IpAddr, SocketAddr},
+use std::{collections::HashMap, net::{IpAddr, SocketAddr},
     path::Path, sync::Arc, time::{Duration, Instant}};
 use tokio::{io::copy_bidirectional, net::{TcpListener, TcpStream}, process::Command,
-    sync::{Mutex, oneshot, Semaphore}, time::timeout};
-use tokio_rustls::{rustls::{pki_types::{CertificateDer, PrivateKeyDer}, ServerConfig}, TlsAcceptor};
-use tracing::{info, warn, error};
+    sync::{Mutex, Semaphore}, time::timeout};
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use tracing::{info, warn};
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -21,7 +18,7 @@ struct Config {
     tls_cert: String,
     tls_key: String,
     username: String,
-    password_hash_file: String,
+    password_file: String,
     authorization_seconds: u64,
     max_clients: usize,
     handshake_timeout_seconds: u64,
@@ -33,7 +30,7 @@ struct State {
     grants: Mutex<HashMap<IpAddr, Instant>>,
     /// One shared state for successful password checks. No credentials are stored.
     config: Config,
-    password_hash: String,
+    password: String,
 }
 impl State {
     async fn allowed(&self, ip: IpAddr) -> bool {
@@ -54,79 +51,27 @@ impl State {
     }
 }
 
-struct Validator {
-    state: Arc<State>,
-    ip: IpAddr,
-    signal: Mutex<Option<oneshot::Sender<()>>>,
-}
-#[async_trait]
-impl CredentialValidator for Validator {
-    async fn validate(&self, creds: &Credentials) -> std::result::Result<CredentialDecision, CredentialValidationError> {
-        // Argon2 verification is CPU intensive, so move to blocking pool.
-        let name_ok = creds.username == self.state.config.username;
-        let candidate = creds.password.clone();
-        let hash = self.state.password_hash.clone();
-        let good = tokio::task::spawn_blocking(move || {
-            PasswordHash::new(&hash).ok().is_some_and(|parsed| Argon2::default().verify_password(candidate.as_bytes(), &parsed).is_ok())
-        }).await.unwrap_or(false);
-        if !name_ok || !good { warn!(peer = %self.ip, "invalid frontend credentials"); return Ok(CredentialDecision::Reject); }
-        match self.state.grant(self.ip).await {
-            Ok(()) => {
-                info!(peer = %self.ip, "frontend authentication succeeded; next connection may proxy");
-                if let Some(tx) = self.signal.lock().await.take() { let _ = tx.send(()); }
-                Ok(CredentialDecision::Accept)
-            }
-            Err(e) => { error!(peer = %self.ip, error = %e, "authorization failed"); Ok(CredentialDecision::Reject) }
-        }
-    }
-}
-
-struct NoopInput;
-impl RdpServerInputHandler for NoopInput {
-    fn keyboard(&mut self, _: KeyboardEvent) {}
-    fn mouse(&mut self, _: MouseEvent) {}
-}
-
-struct NoopDisplay;
-#[async_trait]
-impl RdpServerDisplay for NoopDisplay {
-    async fn size(&mut self) -> DesktopSize { DesktopSize { width: 1024, height: 768 } }
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        // No display is necessary: the connection terminates right after credential validation.
-        bail!("authentication-only server does not support display")
-    }
-}
-
-fn tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    let mut cert_file = BufReader::new(File::open(cert_path)?);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_file).collect::<std::result::Result<_, _>>()?;
-    let mut key_file = BufReader::new(File::open(key_path)?);
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_file)?.context("missing private key")?;
-    let cfg = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
-    Ok(TlsAcceptor::from(Arc::new(cfg)))
-}
-
-async fn auth(stream: TcpStream, peer: SocketAddr, state: Arc<State>, acceptor: TlsAcceptor) -> Result<()> {
-    let (tx, rx) = oneshot::channel();
-    let validator = Arc::new(Validator { state: state.clone(), ip: peer.ip(), signal: Mutex::new(Some(tx)) });
-    let mut server = RdpServer::builder()
-        .with_addr(state.config.listen)
-        .with_tls(acceptor)
-        .with_input_handler(NoopInput)
-        .with_display_handler(NoopDisplay)
-        .with_credential_validator(Some(validator))
-        .build();
+async fn auth(stream: TcpStream, peer: SocketAddr, state: Arc<State>, acceptor: TlsAcceptor, public_key: Arc<Vec<u8>>) -> Result<()> {
     let deadline = Duration::from_secs(state.config.handshake_timeout_seconds);
-    tokio::select! {
-        result = timeout(deadline, server.run_connection(stream)) => {
-            match result { Ok(Ok(())) => Ok(()), Ok(Err(e)) => Err(e), Err(_) => bail!("frontend handshake timeout") }
-        }
-        _ = rx => {
-            // Drop the server future and socket after successful TLS credential validation.
-            // Client reconnects to the same port and enters TCP forwarding mode.
-            Ok(())
-        }
-    }
+    timeout(deadline, async {
+        let credentials = Credentials { username: state.config.username.clone(), password: state.password.clone(), domain: None };
+        let mut rdp = Acceptor::new(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+            DesktopSize { width: 1024, height: 768 }, Vec::new(), Some(credentials));
+        let stream = match ironrdp_acceptor::accept_begin(TokioFramed::new(stream), &mut rdp).await.context("RDP negotiation failed")? {
+            BeginResult::ShouldUpgrade(stream) => stream,
+            BeginResult::Continue(_) => bail!("client did not negotiate NLA"),
+        };
+        let tls = acceptor.accept(stream).await.context("TLS handshake failed")?;
+        let mut framed = TokioFramed::new(tls);
+        rdp.mark_security_upgrade_as_done();
+        if !rdp.should_perform_credssp() { bail!("client did not negotiate CredSSP"); }
+        ironrdp_acceptor::accept_credssp(&mut framed, &mut rdp,
+            &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+            "rdp-client".into(), (*public_key).clone(), None).await.context("NLA authentication failed")?;
+        state.grant(peer.ip()).await.context("authorization failed")?;
+        info!(peer = %peer.ip(), "frontend NLA authentication succeeded; next connection may proxy");
+        Ok(())
+    }).await.context("frontend handshake timeout")?
 }
 
 async fn proxy(mut frontend: TcpStream, peer: SocketAddr, backend: SocketAddr, connect_timeout: Duration) -> Result<()> {
@@ -145,12 +90,18 @@ async fn main() -> Result<()> {
     if config.authorization_seconds == 0 || config.max_clients == 0 || config.listen == config.backend {
         bail!("invalid configuration: duration and concurrency must be positive; listen != backend");
     }
-    let password_hash = std::fs::read_to_string(&config.password_hash_file)?.trim().to_string();
-    PasswordHash::new(&password_hash).map_err(|e| anyhow!("invalid password hash: {e}"))?;
-    let acceptor = tls_acceptor(&config.tls_cert, &config.tls_key)?;
+    let password = std::fs::read_to_string(&config.password_file).context("reading NLA password file")?;
+    // A single final line ending is allowed; other whitespace is part of the password.
+    let password = password.strip_suffix("\r\n").or_else(|| password.strip_suffix('\n')).unwrap_or(&password).to_owned();
+    if password.is_empty() || password.contains(['\r', '\n']) { bail!("NLA password file must contain one nonempty line"); }
+    let identity = TlsIdentityCtx::init_from_paths(Path::new(&config.tls_cert), Path::new(&config.tls_key))?;
+    let tls_config = ServerConfig::builder().with_no_client_auth()
+        .with_single_cert(identity.certs.clone(), identity.priv_key.clone_key())?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let public_key = Arc::new(identity.pub_key);
     let listener = TcpListener::bind(config.listen).await?;
     let sem = Arc::new(Semaphore::new(config.max_clients));
-    let state = Arc::new(State { grants: Mutex::new(HashMap::new()), config, password_hash });
+    let state = Arc::new(State { grants: Mutex::new(HashMap::new()), config, password });
     info!(listen = %state.config.listen, backend = %state.config.backend, "RDP gateway started");
     tokio::task::LocalSet::new().run_until(async move {
         loop {
@@ -158,15 +109,18 @@ async fn main() -> Result<()> {
             let Ok(permit) = sem.clone().try_acquire_owned() else { warn!(%peer, "connection limit exceeded"); continue; };
             let state = state.clone();
             let acceptor = acceptor.clone();
+            let public_key = public_key.clone();
             tokio::task::spawn_local(async move {
                 let _permit = permit;
                 let result = if state.allowed(peer.ip()).await {
                     proxy(stream, peer, state.config.backend,
                         Duration::from_secs(state.config.backend_connect_timeout_seconds)).await
                 } else {
-                    auth(stream, peer, state, acceptor).await
+                    auth(stream, peer, state, acceptor, public_key).await
                 };
-                if let Err(e) = result { warn!(%peer, error = %e, "connection ended"); }
+                // Include the underlying protocol or I/O error, not just the
+                // outer IronRDP context (for example, "accept_begin failed").
+                if let Err(e) = result { warn!(%peer, error = %format_args!("{e:#}"), "connection ended"); }
             });
         }
     }).await
@@ -181,12 +135,12 @@ mod tests {
             listen: "127.0.0.1:3390".parse().unwrap(),
             backend: "127.0.0.1:3391".parse().unwrap(),
             tls_cert: String::new(), tls_key: String::new(),
-            username: "test".into(), password_hash_file: String::new(),
+            username: "test".into(), password_file: String::new(),
             authorization_seconds: 1, max_clients: 10,
             handshake_timeout_seconds: 10, backend_connect_timeout_seconds: 3,
             on_authorized_script: None,
         };
-        let state = State { grants: Mutex::new(HashMap::new()), config: cfg, password_hash: String::new() };
+        let state = State { grants: Mutex::new(HashMap::new()), config: cfg, password: String::new() };
         let ip: IpAddr = "192.0.2.123".parse().unwrap();
         assert!(!state.allowed(ip).await);
         state.grant(ip).await.unwrap();

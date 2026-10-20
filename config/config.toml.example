@@ -1,10 +1,10 @@
 listen = "0.0.0.0:3389"
-backend = "192.168.20.100:3389"
+backend = "192.168.0.107:3389"
 tls_cert = "/etc/rdpx/cert.pem"
 tls_key = "/etc/rdpx/key.pem"
 username = "gateway"
-password_hash_file = "/etc/rdpx/password.argon2"
-authorization_seconds = 300
+password_file = "/etc/rdpx/password"
+authorization_seconds = 3000
 max_clients = 128
 handshake_timeout_seconds = 20
 backend_connect_timeout_seconds = 5
